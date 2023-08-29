@@ -5,44 +5,31 @@ import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
-from google.oauth2.service_account import Credentials
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
 from googleapiclient.discovery import build
-import time
-import socket
-
-def is_connected(hostname="www.google.com"):
-    try:
-        host = socket.gethostbyname(hostname)
-        socket.create_connection((host, 80), 2)
-        return True
-    except:
-        return False
+from google.oauth2.credentials import Credentials
+from apiclient import discovery
+from google.oauth2 import service_account
 
 # For Google Drive
 def authenticate_google_drive():
-    SCOPES = ['https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_file('web-performance-testing-397100-b49d0bb7c522.json', scopes=SCOPES)
-    drive = build('drive', 'v3', credentials=creds)
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    credentials = Credentials.from_service_account_file(
+        scopes=scopes
+    )
+    gc = authenticate_google_sheets()
+    drive = discovery.build('drive', 'v3', credentials=credentials)
     return drive
 
 # For Google Sheets
 def authenticate_google_sheets():
-    SCOPES = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_file('web-performance-testing-397100-b49d0bb7c522.json', scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return client
+    gc = gspread.service_account()
+    return gc
 
-
-
-def create_google_sheet_in_folder(title, folder_id):
-    drive = authenticate_google_drive()
-    file_metadata = {
-        'name': title,
-        'mimeType': 'application/vnd.google-apps.spreadsheet',
-        'parents': [folder_id]
-    }
-    file = drive.files().create(body=file_metadata, fields='id').execute()
-    return file['id']  # Returns the file ID of the created sheet
 
 # Check if a URL is valid
 def is_valid_url(url):
@@ -63,7 +50,7 @@ def get_website_list(sheet_name):
     valid_urls = []
     for url in urls:
         if not is_valid_url(url):
-            fixed_url = "http://" + url  # Try to append "http://" to the URL
+            fixed_url = "https://" + url  # Try to append "https://" to the URL
             if is_valid_url(fixed_url):
                 valid_urls.append(fixed_url)
             else:
@@ -73,94 +60,55 @@ def get_website_list(sheet_name):
 
     return valid_urls
 
-def run_lighthouse_test_with_reconnect(url):
-    while True:
-        if is_connected():
-            return run_lighthouse_test(url)
+def create_google_sheet_in_folder(title, folder_id):
+    drive = authenticate_google_drive()
+    file_metadata = {
+        'name': title,
+        'mimeType': 'application/vnd.google-apps.spreadsheet',
+        'parents': [folder_id]
+    }
+    file = drive.files().create(body=file_metadata).execute()
+    return file['id']  # Returns the file ID of the created sheet
+
+def store_results_in_google_sheet(data, folder_id):
+    title = f"Results - Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    file_id = create_google_sheet_in_folder(title, folder_id)
+    
+    client = authenticate_google_sheets()
+    worksheet = client.open_by_key(file_id).get_worksheet(0)
+    
+    headers = ["Website", "Performance", "Accessibility", "Best Practices", "SEO", "PWA"]
+    worksheet.append_row(headers)
+    
+    for result in data:
+        if isinstance(result[1], dict):
+            row = [result[0]] + [result[1][header] for header in headers[1:]]
         else:
-            print("Internet connection lost. Waiting for reconnection...")
-            time.sleep(30)  # Check every 30 seconds
+            row = [result[0], "Error: " + result[1]]
+        worksheet.append_row(row)
 
 # Run Lighthouse test on a website
 def run_lighthouse_test(url):
     try:
-        result = subprocess.run(['lighthouse', url, '--output=json'],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL,
-                                check=True)  # Check=True will raise CalledProcessError if command returns non-zero exit status
-        data = json.loads(result.stdout)
-        performance_score = data['categories']['performance']['score']
-        return (url, performance_score)
+        result = subprocess.check_output(['lighthouse', url, '--output=json'])
+        data = json.loads(result)
+        scores = {
+            'Performance': data['categories']['performance']['score'],
+            'Accessibility': data['categories']['accessibility']['score'],
+            'Best Practices': data['categories']['best-practices']['score'],
+            'SEO': data['categories']['seo']['score'],
+            'PWA': data['categories']['pwa']['score'] if 'pwa' in data['categories'] else None
+        }
+        return (url, scores)
     except subprocess.CalledProcessError as e:
         return (url, str(e))
-    
-def store_results_in_google_sheet_with_reconnect(data, sheet_name, folder_id):
-    while True:
-        if is_connected():
-            return store_results_in_google_sheet(data, sheet_name, folder_id)
-        else:
-            print("Internet connection lost. Waiting for reconnection...")
-            time.sleep(30)  # Check every 30 seconds
-
-# Store results in a new Google Sheet
-def store_results_in_google_sheet(data, sheet_name, folder_id):
-    client = authenticate_google_sheets()
-    drive_service = authenticate_google_drive()
-    
-    try:
-        # Attempt to open the worksheet
-        worksheet = client.open(sheet_name).get_worksheet(0)
-    except gspread.SpreadsheetNotFound:
-        # If not found, create a new Google Sheet
-        sh = client.create(sheet_name)
-        worksheet = sh.get_worksheet(0)
-        headers = ["Website"]
-        worksheet.append_row(headers)
-        
-        # Move the created sheet to the specified folder
-        file_id = sh.id
-        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-        previous_parents = ",".join(file.get('parents'))
-        file = drive_service.files().update(fileId=file_id,
-                                            addParents=folder_id,
-                                            removeParents=previous_parents,
-                                            fields='id, parents').execute()
-    else:
-        # If sheet exists, fetch the headers
-        headers = worksheet.row_values(1)
-
-    # Check if a new iteration is needed and add a new column header
-    new_column_header = "Performance " + datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    if new_column_header not in headers:
-        headers.append(new_column_header)
-        worksheet.append_row(headers)
-    
-    # Update each row with the new performance score or add new rows if needed
-    for result in data:
-        url = result[0]
-        performance_score = result[1]
-        if not isinstance(performance_score, str):  # If it's not an error message
-            performance_score = str(performance_score)
-        try:
-            cell = worksheet.find(url)
-            worksheet.update_cell(cell.row, len(headers), performance_score)  # Add the performance score in the new column
-        except gspread.exceptions.CellNotFound:
-            # If the website is not already listed in the sheet, add a new row for it
-            new_row = [url] + [""] * (len(headers) - 2) + [performance_score]
-            worksheet.append_row(new_row)
-    
-    # Compute average and update the last cell in the new column
-    avg_formula = f"=AVERAGE(R2C{len(headers)}:R{worksheet.row_count}C{len(headers)})"
-    worksheet.update_cell(worksheet.row_count, len(headers), avg_formula)
 
 def main(iterations, sheet_name, folder_id):
     websites = get_website_list(sheet_name)
     for _ in range(iterations):
         with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(run_lighthouse_test_with_reconnect, websites))
-        store_results_in_google_sheet_with_reconnect(results, sheet_name, folder_id)
-        time.sleep(60)  # Introduce a 1-minute delay between iterations
-
+            results = list(executor.map(run_lighthouse_test, websites))
+        store_results_in_google_sheet(results, folder_id)
 
 if __name__ == "__main__":
     import sys
